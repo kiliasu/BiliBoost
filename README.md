@@ -1,4 +1,5 @@
 # BiliBoost
+[简体中文](./README.zh-CN.md)
 
 A Tampermonkey userscript that keeps Bilibili playable on overseas connections.
 
