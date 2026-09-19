@@ -2,7 +2,7 @@
 // @name         BiliBoost
 // @name:en      BiliBoost
 // @namespace    bili-cdn-optimizer
-// @version      3.8.0
+// @version      3.9.0
 // @description  面向海外用户的B站自适应CDN路由工具
 // @description:en  Per-video adaptive CDN routing for Bilibili overseas users: micro-probe node selection, cold-resource fallback with background cache warming, stall circuit-breaking, and a structured diagnostics panel.
 // @author       33DD99
@@ -22,7 +22,7 @@
 
   // ═══════════════ §1 常量与节点池 ═══════════════
 
-  const VERSION = '3.8.0';
+  const VERSION = '3.9.0';
   const CFG_KEY = 'bili_cdn_opt_cfg_v3';
   const HEALTH_KEY = 'bili_cdn_opt_health_v1';
   const PREMIUM = 'upos-sz-mirrorcosov.bilivideo.com';
@@ -65,9 +65,12 @@
     hedge: true,
     hedgeDelayMs: 900,
     multiSource: true,          // 多源并行Range聚合引擎
+    msLanes: 4,                 // 聚合路数：size 策略下为上限，fixed 策略下为目标路数
+    msSplit: 'size',            // 切分策略：size=按分片尺寸派生路数 | fixed=按路数等分
     msMinSplitKB: 512,          // 达到此跨度才切分
-    msPartKB: 768,              // 目标part大小
-    msMaxParts: 4,              // 并发part上限
+    msPartKB: 768,              // size 策略的目标分片尺寸
+    msMinPartKB: 128,           // fixed 策略的分片下限
+    msPerHost: 2,               // 单节点并发连接上限；第二连接仅在候选节点用尽后分配
     stallMs: 2500,
     rescueJiggle: true,
     bgGuard: true,              // 后台播放保护（回前台快速恢复 + 后台缓冲维持）
@@ -86,6 +89,10 @@
   function jsave(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} }
 
   const cfg = Object.assign({}, DEFAULTS, jload(CFG_KEY, null) || jload('bili_cdn_opt_cfg_v2', null) || {});
+  if (cfg.msMaxParts != null) {   // v3.8 键名迁移：msMaxParts → msLanes
+    if (cfg.msLanes === DEFAULTS.msLanes) cfg.msLanes = cfg.msMaxParts;
+    delete cfg.msMaxParts;
+  }
   const saveCfg = () => jsave(CFG_KEY, cfg);
 
   const health = jload(HEALTH_KEY, {});
@@ -765,6 +772,8 @@
   // 补洞（含短读校验）同时化解单流限速与深部Range停滞。
 
   let msLoadSeq = 0;
+  // 各节点在途连接数（跨装载全局），供首发与补洞的节点分配参考
+  const hostInflight = Object.create(null);
 
   // lane 为可选的UI遥测对象：仅写入进度，不参与任何控制流
   async function msFetchPart(u, host, lo, hi, cs, lane) {
@@ -772,6 +781,7 @@
     const ctrl = new AbortController();
     if (cs) cs.ctrls.push(ctrl);
     if (lane) { lane.host = host; lane.bytes = 0; lane.failed = 0; }
+    hostInflight[host] = (hostInflight[host] || 0) + 1;
     let gotHeaders = false, idleTimer = 0;
     const ttfbTimer = setTimeout(() => { if (!gotHeaders) { try { ctrl.abort(); } catch (e) {} } }, ttfbLimitFor(host));
     const hardTimer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, cfg.bodyDeadlineMs);
@@ -782,6 +792,9 @@
       gotHeaders = true;
       clearTimeout(ttfbTimer);
       const ttfb = Math.round(performance.now() - t0);
+      // 协议画像：hw/08c 系经 CORS 暴露 x-service-module（如 hw-h2-server）。h2 节点的
+      // 并发流复用同一 TCP 连接，第二连接不增带宽，分配第二连接时靠后
+      try { const sm = resp.headers.get('x-service-module'); if (sm) H(host).h2 = /h2/i.test(sm) ? 1 : 0; } catch (e) {}
       if (!resp.ok && resp.status !== 206) { clearTimeout(hardTimer); healthFail(host); return { ok: false, status: resp.status }; }
       const cr = resp.headers.get('Content-Range');
       const total = cr ? +(cr.match(/\/(\d+)/) || [0, 0])[1] : 0;
@@ -822,6 +835,8 @@
       if (!(cs && cs.aborted)) healthFail(host);
       if (lane) lane.failed = 1;
       return { ok: false, err: String(e).slice(0, 50), aborted: cs && cs.aborted };
+    } finally {
+      hostInflight[host] = Math.max(0, (hostInflight[host] || 0) - 1);
     }
   }
 
@@ -838,7 +853,36 @@
     const arr = [...set].filter(h => h && (!RE_AKAM.test(h) || h === u.hostname) && !cfg.disabledHosts.includes(h));
     const scored = arr.map((h, i) => ({ h, i, s: healthScore(h) }));
     scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
-    return scored.map(x => x.h).slice(0, Math.max(3, cfg.msMaxParts + 1));
+    return scored.map(x => x.h).slice(0, Math.max(3, laneCount() + 1));
+  }
+
+  // 路数与单节点连接上限：配置可能来自导入，统一夹取
+  function laneCount() { return Math.min(12, Math.max(1, Math.round(+cfg.msLanes) || 4)); }
+  function perHostLimit() { return Math.min(3, Math.max(1, Math.round(+cfg.msPerHost) || 2)); }
+
+  // 本次装载的分片数：size=按目标分片尺寸向上取整（路数为上限）；fixed=按路数等分，
+  // 受分片下限约束；两者再受"候选节点数×单节点连接上限"封顶
+  function planParts(span, hostCount) {
+    const n = cfg.msSplit === 'fixed'
+      ? Math.floor(span / (Math.max(64, +cfg.msMinPartKB || 128) * 1024))
+      : Math.ceil(span / (Math.max(128, +cfg.msPartKB || 768) * 1024));
+    return Math.max(1, Math.min(laneCount(), n, Math.max(1, hostCount) * perHostLimit()));
+  }
+
+  // 节点分配：在途连接数少者优先 → 第二连接起 h2 节点靠后 → 候选序位（健康分）；
+  // 在途数已达单节点上限的节点仅在别无选择时启用
+  function pickHost(hosts, exclude) {
+    const cap = perHostLimit();
+    let best = null, bestKey = Infinity;
+    for (let i = 0; i < hosts.length; i++) {
+      const h = hosts[i];
+      if (exclude && exclude.has(h)) continue;
+      const n = hostInflight[h] || 0;
+      const h2 = n > 0 && health[h] && health[h].h2 ? 1 : 0;
+      const key = (n >= cap ? 1e6 : 0) + n * 1000 + h2 * 100 + i;
+      if (key < bestKey) { best = h; bestKey = key; }
+    }
+    return best;
   }
 
   // 将 [lo,hi] 切分为若干part跨节点并行拉取，返回 {buffer, total}；任一part全节点失败则整体reject
@@ -846,7 +890,7 @@
     const span = hi - lo + 1;
     const hosts = engineHosts(u);
     if (!hosts.length) throw new Error('no hosts');
-    const nParts = Math.max(1, Math.min(cfg.msMaxParts, Math.ceil(span / (cfg.msPartKB * 1024))));
+    const nParts = planParts(span, hosts.length);
     const step = Math.ceil(span / nParts);
     const bounds = [];
     for (let i = 0; i < nParts; i++) bounds.push([lo + i * step, Math.min(hi, lo + (i + 1) * step - 1)]);
@@ -855,7 +899,7 @@
     let fetched = 0, fileTotal = 0;
     // 实际填充到的绝对末端：跨度越过文件尾时尾段合法短于请求量；out 按 span
     // 预分配，不裁剪会把未填充区的零字节当媒体数据交给播放器
-    let realEnd = lo - 1;
+    let realEnd = lo - 1, lastHostUsed = hosts[0];
     const partStats = [];
     state.msActive++;
     const loadId = ++msLoadSeq;
@@ -871,6 +915,7 @@
         // 仅尾段允许短于请求量；中间段短读会在合成缓冲留下空洞
         if (n < expect && idx !== nParts - 1) throw new Error(`part${idx} 非尾段短读 ${n}/${expect}`);
         if (lane) { lane.host = host; lane.bytes = n; lane.done = 1; lane.failed = 0; }
+        lastHostUsed = host;
         out.set(new Uint8Array(r.buf), plo - lo);
         const end = plo + n - 1;
         if (end > realEnd) realEnd = end;
@@ -883,26 +928,32 @@
         if (attempt > 0) { state.msHoleFills++; log('info', 'net', `多源补洞: part${idx} 由 ${shortHost(host)} 补齐（第${attempt + 1}次尝试）`); }
         if (onProgress) onProgress(fetched, span);
       };
-      // 首发单节点（健康分排序后命中率高）；重试即对冲——双节点并发先成者胜
-      const h0 = hosts[idx % hosts.length];
+      // 首发按在途连接数与健康分序位选节点（各 lane 的选择在首个 await 前同步完成，
+      // 前序 lane 的记账对后序可见）；重试即对冲——两个未试过的节点并发先成者胜，
+      // 候选耗尽时才允许回到已试节点
+      const tried = new Set();
+      const h0 = pickHost(hosts, tried);
+      tried.add(h0);
       if (cs.aborted) throw abortError();
       const r0 = await msFetchPart(u, h0, plo, phi, cs, lanes[idx]);
       if (r0.ok) { commit(r0, 0, h0); return; }
       if (r0.aborted) throw abortError();
       for (let round = 1; round <= 2; round++) {
         if (cs.aborted) throw abortError();
-        const hA = hosts[(idx + round * 2 - 1) % hosts.length];
-        const hB = hosts[(idx + round * 2) % hosts.length];
+        const hA = pickHost(hosts, tried) || pickHost(hosts, null);
+        tried.add(hA);
+        const hB = pickHost(hosts, tried);
+        if (hB) tried.add(hB);
         const r = await new Promise((resolve) => {
           let settled = false, fails = 0;
-          const need = hA === hB ? 1 : 2;
+          const need = hB ? 2 : 1;
           const settle = (x, h) => {
             if (settled) return;
             if (x.ok) { settled = true; resolve({ win: x, host: h }); }
             else if (++fails >= need) { settled = true; resolve({ win: x, host: h }); }
           };
           msFetchPart(u, hA, plo, phi, cs, lanes[idx]).then(x => settle(x, hA));
-          if (hB !== hA) msFetchPart(u, hB, plo, phi, cs).then(x => settle(x, hB));
+          if (hB) msFetchPart(u, hB, plo, phi, cs).then(x => settle(x, hB));
         });
         if (r.win.ok) { commit(r.win, round, r.host); return; }
         if (r.win.aborted) throw abortError();
@@ -914,7 +965,7 @@
       setTimeout(() => { if (state.msLanes === lanes) state.msLanes = []; }, 450);   // 保留完成态闪光
     }
     state.msLoads++;
-    state.lastSegHost = nParts > 1 ? `多源聚合×${nParts}` : hosts[0];
+    state.lastSegHost = nParts > 1 ? `多源聚合×${nParts}` : lastHostUsed;
     const wallMs = Math.round(performance.now() - t0);
     if (wallMs > 4000) {
       log('warn', 'net', `装载偏慢 ${(wallMs / 1000).toFixed(1)}s (${Math.round(span / 1024)}KB): ` +
@@ -1460,7 +1511,8 @@
     }
     if (state.msLoads > 0) {
       add('ok', `多源聚合引擎生效：${state.msLoads} 次装载`,
-        `共 ${state.msParts} 个并行 part，跨节点补洞 ${state.msHoleFills} 次。`);
+        `共 ${state.msParts} 个并行 part，跨节点补洞 ${state.msHoleFills} 次；` +
+        `路数 ${laneCount()}（${cfg.msSplit === 'fixed' ? '固定路数' : '按分片尺寸'}），单节点连接上限 ${perHostLimit()}。`);
     }
     const probeR = state.probeInfoByCid[cid];
     const burst = probeR && probeR.find(r => r.ok && r.deepMbps != null && r.headMbps / Math.max(0.1, r.deepMbps) > 5);
@@ -2129,7 +2181,7 @@ details.bco-adv > div { animation:bcoRise .3s var(--bco-ease) both; padding-top:
     const stEl = ui.panel.querySelector('#bco-ms-state');
     const par = ui.panel.querySelector('#bco-par');
     if (par) {
-      const want = Math.max(4, Math.min(8, lanes.length || 4));
+      const want = Math.max(laneCount(), lanes.length);
       if (par.children.length !== want) par.innerHTML = '<i></i>'.repeat(want);
       const live = lanes.filter(l => !l.done && !l.failed).length;
       [...par.children].forEach((c, i) => c.classList.toggle('on', i < live));
@@ -2398,6 +2450,7 @@ details.bco-adv > div { animation:bcoRise .3s var(--bco-ease) both; padding-top:
   // ═══ 设置页 ═══
   function renderSettings(el) {
     const modes = [['auto', '自适应'], ['smart', '轻量'], ['force', '锁定']];
+    const splits = [['size', '按分片尺寸'], ['fixed', '固定路数']];
     const pinOpts = enabledHosts().map(p =>
       `<option value="${esc(p.host)}" ${cfg.pinHost === p.host ? 'selected' : ''}>${esc(p.label)} — ${esc(shortHost(p.host))}</option>`);
     if (!enabledHosts().some(p => p.host === cfg.pinHost)) {
@@ -2435,8 +2488,17 @@ details.bco-adv > div { animation:bcoRise .3s var(--bco-ease) both; padding-top:
       </div>
 
       <div class="bco-card" style="--i:3">
-        <h4 class="bco-ct">功能开关</h4>
+        <h4 class="bco-ct">多源聚合</h4>
         ${sw('bco-ms', cfg.multiSource, '多源并行聚合')}
+        ${sld('bco-lanes', '聚合路数', 1, 12, 1, laneCount(), laneCount() + ' 路')}
+        <div class="bco-seg" id="bco-split" style="margin-top:4px">
+          ${splits.map(([v, l]) => `<button data-v="${v}" class="${cfg.msSplit === v ? 'on' : ''}">${l}</button>`).join('')}
+          <i class="bco-segind"></i>
+        </div>
+      </div>
+
+      <div class="bco-card" style="--i:4">
+        <h4 class="bco-ct">功能开关</h4>
         ${sw('bco-hedge', cfg.hedge, '对冲请求')}
         ${sw('bco-bg', cfg.bgGuard, '后台标签页保护')}
         ${sw('bco-warm', cfg.warmPremium, '后台缓存预热')}
@@ -2445,9 +2507,13 @@ details.bco-adv > div { animation:bcoRise .3s var(--bco-ease) both; padding-top:
         ${sw('bco-mcdn', cfg.replaceMcdn, '重写 MCDN 节点')}
       </div>
 
-      <details class="bco-adv" style="--i:4"><summary>高级参数与备份</summary><div>
+      <details class="bco-adv" style="--i:5"><summary>高级参数与备份</summary><div>
         ${sld('bco-psize', '微探测采样', 64, 512, 64, cfg.probeSizeKB, cfg.probeSizeKB + 'KB')}
         ${sld('bco-idle', '传输空闲超时', 2000, 8000, 500, cfg.idleTimeoutMs, (cfg.idleTimeoutMs / 1000).toFixed(1) + 's')}
+        ${sld('bco-partkb', '分片目标尺寸', 256, 2048, 128, cfg.msPartKB, cfg.msPartKB + 'KB')}
+        ${sld('bco-minpart', '固定路数分片下限', 64, 512, 64, cfg.msMinPartKB, cfg.msMinPartKB + 'KB')}
+        ${sld('bco-splitkb', '切分阈值', 256, 2048, 128, cfg.msMinSplitKB, cfg.msMinSplitKB + 'KB')}
+        ${sld('bco-perhost', '单节点连接上限', 1, 3, 1, perHostLimit(), perHostLimit() + ' 连接')}
         <div class="bco-sec" style="margin-top:10px">
           <h4>节点黑名单（每行一个主机名）</h4>
           <textarea id="bco-avoid" rows="2">${esc((cfg.avoidHosts || []).join('\n'))}</textarea>
@@ -2518,6 +2584,28 @@ details.bco-adv > div { animation:bcoRise .3s var(--bco-ease) both; padding-top:
     bindSld('bco-hedged', 'hedgeDelayMs', v => v + 'ms');
     bindSld('bco-psize', 'probeSizeKB', v => v + 'KB');
     bindSld('bco-idle', 'idleTimeoutMs', v => (v / 1000).toFixed(1) + 's');
+    bindSld('bco-lanes', 'msLanes', v => v + ' 路');
+    bindSld('bco-partkb', 'msPartKB', v => v + 'KB');
+    bindSld('bco-minpart', 'msMinPartKB', v => v + 'KB');
+    bindSld('bco-splitkb', 'msMinSplitKB', v => v + 'KB');
+    bindSld('bco-perhost', 'msPerHost', v => v + ' 连接');
+
+    const splitSeg = $('#bco-split');
+    const moveSplit = () => {
+      const btns = [...splitSeg.querySelectorAll('button')];
+      const idx = btns.findIndex(b => b.getAttribute('data-v') === cfg.msSplit);
+      const ind = splitSeg.querySelector('.bco-segind');
+      ind.style.width = `calc((100% - 6px) / ${btns.length})`;
+      ind.style.transform = `translateX(calc(${Math.max(0, idx)} * 100%))`;
+    };
+    requestAnimationFrame(moveSplit);
+    moveSplit();
+    splitSeg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      cfg.msSplit = b.getAttribute('data-v');
+      splitSeg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+      saveCfg(); moveSplit();
+      log('info', 'sys', '切分策略 → ' + (cfg.msSplit === 'fixed' ? '固定路数' : '按分片尺寸'));
+    }));
 
     $('#bco-avoid').addEventListener('change', e => {
       cfg.avoidHosts = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); saveCfg();
