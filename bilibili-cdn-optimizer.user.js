@@ -827,6 +827,7 @@
         const { done, value } = await reader.read();
         if (done) break;
         got += value.length;
+        bytesThisTick += value.length;          // 吞吐按到达计量，在途分片也计入实时速率
         chunks.push(value);
         lastChunk = performance.now();
         if (lane) lane.bytes = got;
@@ -935,7 +936,6 @@
         const end = plo + n - 1;
         if (end > realEnd) realEnd = end;
         fetched += r.buf.byteLength;
-        bytesThisTick += r.buf.byteLength;
         pushFlow(host, r.buf.byteLength);
         if (r.total) fileTotal = r.total;
         state.msParts++;
@@ -1255,10 +1255,15 @@
       this.addEventListener('readystatechange', function () {
         if (entry && this.readyState === 2 && entry.ttfb < 0) entry.ttfb = Math.round(performance.now() - t0);
       });
+      // 吞吐按到达计量：progress 逐段累加，load 时补齐余量
+      let metered = 0;
+      this.addEventListener('progress', function (e) {
+        if (e.loaded > metered) { bytesThisTick += e.loaded - metered; metered = e.loaded; }
+      });
       this.addEventListener('load', function () {
         try {
           const n = (this.response && this.response.byteLength) || 0;
-          bytesThisTick += n;
+          if (n > metered) { bytesThisTick += n - metered; metered = n; }
           pushFlow(host, n);
           state.lastSegHost = host;
           if (entry) {
@@ -2030,13 +2035,12 @@ table.rq { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
     return !!(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName));
   }
 
-  // 近 3 秒平均吞吐：分片按完成时刻计量，逐秒值起伏大，显示用平均值
+  // 近 2~3 秒平均吞吐（含正在累计的这一秒）：分段请求时断时续，逐秒值起伏大，显示用平均值
   function recentMbps() {
-    const w = state.bytesWindow, k = Math.min(3, w.length);
-    if (!k) return 0;
-    let b = 0;
-    for (let i = w.length - k; i < w.length; i++) b += w[i].bytes;
-    return b * 8 / 1e6 / k;
+    const w = state.bytesWindow, last = w[w.length - 1];
+    let b = bytesThisTick, secs = last ? Math.min(1, Math.max(0, (Date.now() - last.t) / 1000)) : 0;
+    for (let i = Math.max(0, w.length - 2); i < w.length; i++) { b += w[i].bytes; secs += 1; }
+    return secs > 0 ? b * 8 / 1e6 / secs : 0;
   }
 
   // 胶囊状态只反映影响观看的事件：播放器报错（60 秒内）→ err；卡顿熔断（30 秒内）或流量盲区 → warn
@@ -2059,12 +2063,16 @@ table.rq { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
     if (!ui) return;
     const c = ui.cap, s = statusInfo();
     c.setAttribute('data-st', s.st);
-    const v = recentMbps();
-    ui.capVal.textContent = !cfg.enabled ? '已停用' : (v >= 0.05 ? fmtRate(v) : '—');
+    syncCapVal();
     ui.capUnit.hidden = !cfg.enabled;
     const n = engineOn() ? Math.min(6, laneCount()) : 0;
     if (ui.capLanes.children.length !== n) ui.capLanes.innerHTML = '<i></i>'.repeat(n);
     c.title = `BiliBoost · ${cfg.enabled ? MODE_NAME[cfg.mode] + '模式' : '已停用'}`;
+  }
+
+  function syncCapVal() {
+    const v = recentMbps();
+    setText(ui.capVal, !cfg.enabled ? '已停用' : (v >= 0.05 ? fmtRate(v) : '—'));
   }
 
   // 胶囊里的小竖条 = 当前装载的各路进度
@@ -2081,6 +2089,8 @@ table.rq { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
 
   function frame() {
     syncCapLanes();
+    const now = performance.now();
+    if (now - (ui.capValAt || 0) > 300) { ui.capValAt = now; syncCapVal(); }   // 装载期间速率随到随显
     if (isOpen() && activeView === 'overview' && cfg.enabled) { tweenHero(); drawChart(); syncStrip(); }
   }
 
