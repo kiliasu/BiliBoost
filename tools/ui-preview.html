@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BiliBoost 界面预览</title>
+<!--
+  本地预览 BiliBoost 的界面：模拟一个 B 站视频页，并用假的 CDN 节点响应脚本的真实网络逻辑
+  （测速、多源装载、回退、熔断都是脚本本身在跑）。直接用浏览器打开本文件即可，不会访问 B 站。
+  地址参数：?dark=1 深色页面 · ?s=cold|flaky|congested 场景
+-->
+<style>
+  :root { --bg: #fff; --bg2: #f1f2f3; --bg3: #e3e5e7; --ink: #18191c; --ink2: #61666d; --ink3: #9499a0; --blue: #00aeec; --pink: #ff6699; }
+  html.bili_dark { --bg: #17181a; --bg2: #232527; --bg3: #2f3134; --ink: #e3e5e7; --ink2: #a2a7ae; --ink3: #6d7278; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  a { color: inherit; text-decoration: none; }
+  .hdr { display: flex; align-items: center; gap: 24px; height: 64px; padding: 0 24px; border-bottom: 1px solid var(--bg3); }
+  .hdr nav { display: flex; gap: 18px; font-size: 14px; }
+  .logo { font: 700 22px/1 system-ui, sans-serif; color: var(--blue); letter-spacing: -.02em; margin-right: 6px; }
+  .search { flex: 0 1 460px; margin: 0 auto; height: 40px; border-radius: 8px; background: var(--bg2); display: flex; align-items: center; padding: 0 14px; color: var(--ink3); }
+  .hdr-r { display: flex; align-items: center; gap: 18px; font-size: 13px; color: var(--ink2); }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #ffd1dc, #bde3ff); }
+  .upload { height: 34px; padding: 0 18px; border: 0; border-radius: 8px; background: var(--pink); color: #fff; font-size: 14px; }
+  .page { display: flex; gap: 30px; max-width: 1560px; margin: 0 auto; padding: 22px 36px 80px; }
+  .left { flex: 1 1 auto; min-width: 0; }
+  .right { flex: 0 0 350px; }
+  h1 { margin: 0 0 6px; font-size: 20px; font-weight: 500; }
+  .meta { color: var(--ink3); font-size: 13px; margin-bottom: 14px; }
+  .bpx-player-container { position: relative; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: #000; }
+  .bpx-player-container[data-screen="web"] { position: fixed; inset: 0; z-index: 100000; aspect-ratio: auto; border-radius: 0; }
+  .scene { position: absolute; inset: 0; background:
+      radial-gradient(120% 70% at 70% 105%, #2b3a55 0 30%, transparent 31%),
+      radial-gradient(90% 55% at 20% 110%, #1f2b42 0 38%, transparent 39%),
+      linear-gradient(180deg, #0d1424 0%, #2c3e63 46%, #d98c6a 78%, #f2c48d 100%); }
+  .scene::after { content: ''; position: absolute; left: 62%; top: 58%; width: 44px; height: 44px; border-radius: 50%;
+      background: #ffe3b0; box-shadow: 0 0 60px 20px rgba(255, 210, 150, .35); }
+  video { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; }
+  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 16px 10px; background: linear-gradient(transparent, rgba(0,0,0,.55)); color: #fff; font-size: 12px; }
+  .pbar { position: relative; height: 3px; border-radius: 2px; background: rgba(255,255,255,.25); margin-bottom: 8px; }
+  .pbar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; }
+  .pbar .buf { background: rgba(255,255,255,.45); }
+  .pbar .played { background: var(--blue); }
+  .cbar { display: flex; justify-content: space-between; opacity: .9; }
+  .actions { display: flex; gap: 28px; padding: 16px 0; border-bottom: 1px solid var(--bg3); color: var(--ink2); font-size: 13px; }
+  .desc { padding: 16px 0; color: var(--ink2); font-size: 14px; }
+  .cmt { display: flex; gap: 14px; padding: 16px 0; border-top: 1px solid var(--bg3); }
+  .cmt i { flex: none; width: 40px; height: 40px; border-radius: 50%; background: var(--bg2); }
+  .cmt b { display: block; font-size: 13px; font-weight: 500; color: var(--ink2); margin-bottom: 4px; }
+  .up { display: flex; gap: 12px; align-items: center; margin-bottom: 18px; }
+  .up i { width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, #c8f0e0, #ffe0c8); }
+  .up b { display: block; font-weight: 500; color: var(--pink); }
+  .up span { font-size: 12px; color: var(--ink3); }
+  .follow { margin-left: auto; height: 30px; padding: 0 16px; border: 0; border-radius: 6px; background: var(--blue); color: #fff; }
+  .dm { height: 44px; border-radius: 6px; background: var(--bg2); display: flex; align-items: center; padding: 0 14px; color: var(--ink2); font-size: 14px; margin-bottom: 18px; }
+  .rec { display: flex; gap: 10px; margin-bottom: 12px; }
+  .rec .th { flex: none; width: 141px; height: 80px; border-radius: 6px; }
+  .rec p { margin: 0 0 6px; font-size: 13px; line-height: 1.45; }
+  .rec span { font-size: 12px; color: var(--ink3); }
+  .dev { position: fixed; left: 12px; bottom: 12px; z-index: 2147483600; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    max-width: 560px; padding: 8px 10px; border-radius: 10px; background: rgba(20,20,22,.86); color: #ddd; font: 12px/1.4 system-ui, sans-serif; }
+  .dev b { font-weight: 600; color: #fff; margin-right: 2px; }
+  .dev button { height: 24px; padding: 0 9px; border: 0; border-radius: 6px; background: rgba(255,255,255,.12); color: #eee; font: inherit; cursor: pointer; }
+  .dev button[aria-pressed="true"] { background: #fff; color: #111; }
+  .dev .sep { width: 1px; height: 16px; background: rgba(255,255,255,.2); margin: 0 2px; }
+</style>
+
+<script>
+// ── 1. 模拟 CDN：在脚本捕获原生 fetch / XHR 之前替换掉它们 ──
+(function () {
+  const MB = 1048576, CHUNK = 32768;
+  const qs = new URLSearchParams(location.search);
+  if (qs.get('dark') === '1') document.documentElement.classList.add('bili_dark');
+
+  // 每条连接的速率上限（Mbps）、首字节延迟、失败率；cosov 只缓存了文件开头（后段很慢）
+  const NODES = {
+    'upos-sz-mirrorcosov.bilivideo.com': { ttfb: 170, mbps: 16, deep: 1.8, fail: 0.02 },
+    'upos-sz-mirrorali.bilivideo.com':   { ttfb: 240, mbps: 7.5, fail: 0.03 },
+    'upos-sz-mirrorhw.bilivideo.com':    { ttfb: 220, mbps: 6.4, fail: 0.03, h2: 1 },
+    'upos-sz-mirrorcos.bilivideo.com':   { ttfb: 270, mbps: 5.6, fail: 0.05 },
+    'upos-sz-mirror08c.bilivideo.com':   { ttfb: 310, mbps: 4.8, fail: 0.06, h2: 1 },
+    'upos-tf-all-tx.bilivideo.com':      { ttfb: 380, mbps: 3.2, fail: 0.09 },
+    'upos-tf-all-hw.bilivideo.com':      { ttfb: 360, mbps: 3.6, fail: 0.07 },
+  };
+  const sim = window.__sim = { scenario: 'normal', down: {}, extraFail: {}, congestion: 1 };
+  const model = (h) => NODES[h] || { ttfb: 400, mbps: 3, fail: 0.05 };
+  const fileSize = (path) => (/-30\d{3}\.m4s/.test(path) ? 11 * MB : 260 * MB);
+
+  sim.setScenario = function (name) {
+    sim.scenario = name; sim.down = {}; sim.extraFail = {}; sim.congestion = 1;
+    if (name === 'cold') {
+      // 冷门视频：海外节点起初没有缓存（无响应），30 秒后回源完成，整段都快
+      const cosov = 'upos-sz-mirrorcosov.bilivideo.com';
+      sim.down[cosov] = true;
+      setTimeout(() => {
+        if (sim.scenario !== 'cold') return;
+        delete sim.down[cosov];
+        NODES[cosov] = Object.assign({}, NODES[cosov], { ttfb: 12, mbps: 120, deep: 0 });
+      }, 30000);
+    }
+    if (name === 'flaky') sim.extraFail = { 'upos-sz-mirrorali.bilivideo.com': 0.45, 'upos-sz-mirrorhw.bilivideo.com': 0.35 };
+    if (name === 'congested') sim.congestion = 0.1;
+  };
+  sim.setScenario(qs.get('s') || 'normal');
+
+  function fate(host, m) {
+    if (sim.down[host]) return 'hang';
+    const f = m.fail + (sim.extraFail[host] || 0), r = Math.random();
+    if (r < f * 0.45) return 'hang';
+    if (r < f) return 'stall';
+    return 'ok';
+  }
+  function bytesPerMs(m, off) {
+    let mbps = m.deep && off > 3 * MB ? m.deep : m.mbps;
+    mbps *= sim.congestion * (0.7 + Math.random() * 0.6);
+    return Math.max(0.05, mbps) * 1e6 / 8 / 1000;
+  }
+  const abortErr = () => new DOMException('The user aborted a request.', 'AbortError');
+
+  function simFetch(u, range, signal) {
+    const host = u.hostname, m = model(host), total = fileSize(u.pathname);
+    let lo = 0, hi = total - 1;
+    const mm = range && /bytes=(\d+)-(\d*)/.exec(range);
+    if (mm) { lo = +mm[1]; if (mm[2]) hi = Math.min(+mm[2], total - 1); }
+    return new Promise((resolve, reject) => {
+      let settled = false, timer = 0;
+      if (signal && signal.aborted) { reject(abortErr()); return; }
+      if (signal) signal.addEventListener('abort', () => { if (!settled) { settled = true; clearTimeout(timer); reject(abortErr()); } }, { once: true });
+      if (lo > hi) { settled = true; resolve(new Response(null, { status: 416 })); return; }
+      const f = fate(host, m);
+      if (f === 'hang') return;                      // 不响应，等调用方超时中止
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const len = hi - lo + 1;
+        let sent = 0;
+        const body = new ReadableStream({
+          pull(c) {
+            return new Promise((res) => {
+              const fail = () => { try { c.error(abortErr()); } catch (e) {} res(); };
+              if (signal && signal.aborted) return fail();
+              if (sent >= len) { c.close(); res(); return; }
+              if (f === 'stall' && sent >= len * 0.35) {       // 传一部分后断流
+                if (signal) signal.addEventListener('abort', fail, { once: true });
+                return;
+              }
+              const n = Math.min(CHUNK, len - sent);
+              setTimeout(() => {
+                if (signal && signal.aborted) return fail();
+                c.enqueue(new Uint8Array(n)); sent += n; res();
+              }, n / bytesPerMs(m, lo + sent));
+            });
+          },
+        }, { highWaterMark: 0 });
+        const headers = new Headers({ 'Content-Type': 'video/mp4', 'Content-Length': String(len),
+                                      'Content-Range': `bytes ${lo}-${hi}/${total}` });
+        if (m.h2) headers.set('x-service-module', 'hw-h2-server');
+        resolve(new Response(body, { status: range ? 206 : 200, headers }));
+      }, m.ttfb * (0.7 + Math.random() * 0.7) / Math.max(0.3, sim.congestion));
+    });
+  }
+  sim.simFetch = simFetch;
+
+  const isCdn = (h) => /\.bilivideo\.(com|cn)$|\.akamaized\.net$/.test(h);
+  const realFetch = window.fetch;
+  window.fetch = function (input, init) {
+    let u;
+    try { u = new URL(typeof input === 'string' ? input : input.url, location.href); } catch (e) { return realFetch.apply(this, arguments); }
+    if (!isCdn(u.hostname)) return realFetch.apply(this, arguments);
+    let range = null;
+    const h = init && init.headers;
+    if (h) range = h instanceof Headers ? h.get('range') : (h.Range || h.range);
+    if (!range && input instanceof Request) range = input.headers.get('range');
+    const signal = (init && init.signal) || (input instanceof Request ? input.signal : null);
+    return simFetch(u, range, signal);
+  };
+
+  class FakeXHR extends EventTarget {
+    constructor() {
+      super();
+      this.readyState = 0; this.status = 0; this.statusText = ''; this.response = null; this.responseText = '';
+      this.responseType = ''; this.responseURL = ''; this.timeout = 0; this.withCredentials = false;
+      this._h = {}; this._rh = null; this._ctrl = null;
+    }
+    open(method, url) { this._url = String(url); this.readyState = 1; }
+    setRequestHeader(k, v) { this._h[String(k).toLowerCase()] = String(v); }
+    getResponseHeader(k) { return this._rh ? this._rh.get(k) : null; }
+    getAllResponseHeaders() { let s = ''; if (this._rh) this._rh.forEach((v, k) => { s += k + ': ' + v + '\r\n'; }); return s; }
+    overrideMimeType() {}
+    abort() { if (this._ctrl) this._ctrl.abort(); }
+    send() {
+      const ctrl = this._ctrl = new AbortController();
+      const fire = (t) => this.dispatchEvent(new Event(t));
+      fire('loadstart');
+      simFetch(new URL(this._url, location.href), this._h.range || null, ctrl.signal).then(async (resp) => {
+        this.status = resp.status; this.statusText = resp.statusText; this._rh = resp.headers; this.responseURL = this._url;
+        this.readyState = 2; fire('readystatechange');
+        this.readyState = 3; fire('readystatechange');
+        const buf = await resp.arrayBuffer();
+        this.response = this.responseType === 'arraybuffer' ? buf : (this.responseType === 'blob' ? new Blob([buf]) : '');
+        this.readyState = 4; fire('readystatechange');
+        this.dispatchEvent(new ProgressEvent('load', { lengthComputable: true, loaded: buf.byteLength, total: buf.byteLength }));
+        fire('loadend');
+      }).catch((e) => {
+        this.readyState = 4; fire('readystatechange');
+        fire(e && e.name === 'AbortError' ? 'abort' : 'error');
+        fire('loadend');
+      });
+    }
+  }
+  window.XMLHttpRequest = FakeXHR;
+})();
+</script>
+
+<script src="../bilibili-cdn-optimizer.user.js"></script>
+
+<script>
+// ── 2. 播放信息 + 模拟播放器：按缓冲余量用 XHR Range 请求分段（与 B 站播放器相同的通道）──
+(function () {
+  const sim = window.__sim;
+  const Q = 'e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfq&uipk=5&nbs=1&deadline=1790000000&gen=playurlv2&os=cosovbv&oi=0&trid=preview&platform=pc&og=cos&upsig=preview&bvc=vod&nettype=0&bw=520000&logo=80000000';
+  const base = 'https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/48/21/1234567890/1234567890-1-';
+  window.__playinfo__ = { code: 0, data: { quality: 120, dash: {
+    video: [{ id: 120, baseUrl: base + '100050.m4s?' + Q, backupUrl: [] }],
+    audio: [{ id: 30280, baseUrl: base + '30280.m4s?' + Q, backupUrl: [] }],
+  } } };
+  if (sim.scenario === 'cold' && window.__biliCdnOpt) window.__biliCdnOpt.cfg.warmIntervalMs = 6000;
+
+  const P = window.__player = { t: 0, bufEnd: 0, started: false, paused: false, waiting: false, vOff: 1400, aOff: 900, dur: 732 };
+  const SEG = 4, TARGET = 36, ABYTES = 96 * 1024;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let video;
+
+  function rangeXHR(url, lo, hi) {
+    return new Promise((resolve) => {
+      const x = new XMLHttpRequest();
+      const killer = setTimeout(() => x.abort(), 12000);
+      const done = (ok) => { clearTimeout(killer); resolve(ok); };
+      x.open('GET', url);
+      x.responseType = 'arraybuffer';
+      x.setRequestHeader('Range', `bytes=${lo}-${hi}`);
+      x.addEventListener('load', () => done(x.status === 206 || x.status === 200));
+      x.addEventListener('error', () => done(false));
+      x.addEventListener('abort', () => done(false));
+      x.send();
+    });
+  }
+  async function loadLoop() {
+    const pi = window.__playinfo__.data.dash;
+    await rangeXHR(pi.video[0].baseUrl, 0, 1399);          // 初始化段
+    for (;;) {
+      if (P.paused || P.bufEnd - P.t >= TARGET) { await sleep(300); continue; }
+      const vLen = Math.round((1.6 + Math.random() * 1.4) * 1048576);
+      const [ok] = await Promise.all([
+        rangeXHR(pi.video[0].baseUrl, P.vOff, P.vOff + vLen - 1),
+        rangeXHR(pi.audio[0].baseUrl, P.aOff, P.aOff + ABYTES - 1),
+      ]);
+      if (ok) {
+        P.vOff += vLen; P.aOff += ABYTES; P.bufEnd = Math.min(P.dur, P.bufEnd + SEG);
+        if (!P.started) { P.started = true; video.dispatchEvent(new Event('playing')); }
+      } else await sleep(400);
+    }
+  }
+  const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  function tick() {
+    if (P.started && !P.paused) {
+      if (P.bufEnd - P.t > 0.3) {
+        P.t += 0.25;
+        if (P.waiting) { P.waiting = false; video.dispatchEvent(new Event('playing')); }
+        video.dispatchEvent(new Event('timeupdate'));
+      } else if (!P.waiting) { P.waiting = true; video.dispatchEvent(new Event('waiting')); }
+    }
+    document.querySelector('.pbar .played').style.width = (P.t / P.dur * 100) + '%';
+    document.querySelector('.pbar .buf').style.width = (P.bufEnd / P.dur * 100) + '%';
+    document.querySelector('.cbar .tm').textContent = `${fmt(P.t)} / ${fmt(P.dur)}`;
+  }
+  function patchVideo(v) {
+    const def = (k, get, set) => Object.defineProperty(v, k, { configurable: true, get, set });
+    def('currentTime', () => P.t, (x) => { P.t = Math.max(0, +x || 0); });
+    def('paused', () => !P.started || P.paused);
+    def('seeking', () => false);
+    def('ended', () => false);
+    def('readyState', () => (P.bufEnd - P.t > 1 ? 4 : (P.started ? 2 : 0)));
+    def('buffered', () => ({ length: P.bufEnd > 0 ? 1 : 0, start: () => 0, end: () => P.bufEnd }));
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    video = document.querySelector('video');
+    patchVideo(video);
+    setInterval(tick, 250);
+    loadLoop();
+
+    // 预览工具条
+    const bar = document.querySelector('.dev');
+    const qs = new URLSearchParams(location.search);
+    const go = (k, v) => { if (v == null) qs.delete(k); else qs.set(k, v); location.search = qs.toString(); };
+    bar.querySelectorAll('[data-s]').forEach(b => {
+      b.setAttribute('aria-pressed', String(b.dataset.s === sim.scenario));
+      b.onclick = () => {
+        if (b.dataset.s === 'cold') return go('s', 'cold');
+        sim.setScenario(b.dataset.s);
+        bar.querySelectorAll('[data-s]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+      };
+    });
+    const dark = document.documentElement.classList.contains('bili_dark');
+    bar.querySelector('[data-theme]').textContent = dark ? '浅色页面' : '深色页面';
+    bar.querySelector('[data-theme]').onclick = () => document.documentElement.classList.toggle('bili_dark');
+    bar.querySelector('[data-pause]').onclick = (e) => {
+      P.paused = !P.paused; e.target.textContent = P.paused ? '继续播放' : '暂停';
+      video.dispatchEvent(new Event(P.paused ? 'pause' : 'playing'));
+    };
+    bar.querySelector('[data-web]').onclick = () => {
+      const c = document.querySelector('.bpx-player-container');
+      c.setAttribute('data-screen', c.getAttribute('data-screen') === 'web' ? 'normal' : 'web');
+    };
+    bar.querySelector('[data-reset]').onclick = () => {
+      ['bili_cdn_opt_cfg_v3', 'bili_cdn_opt_health_v1'].forEach(k => localStorage.removeItem(k));
+      location.search = '';
+    };
+  });
+})();
+</script>
+</head>
+<body>
+  <header class="hdr">
+    <span class="logo">bilibili</span>
+    <nav><a>首页</a><a>番剧</a><a>直播</a><a>游戏中心</a><a>会员购</a><a>漫画</a></nav>
+    <div class="search">冰岛 自驾 4K</div>
+    <div class="hdr-r"><i class="avatar"></i><a>大会员</a><a>消息</a><a>动态</a><a>收藏</a><a>历史</a><button class="upload">投稿</button></div>
+  </header>
+  <main class="page">
+    <div class="left">
+      <h1>【4K】在冰岛开了七天车，这是我见过最安静的公路</h1>
+      <div class="meta">12.4万播放 · 1832 弹幕 · 2026-09-20 18:00</div>
+      <div class="bpx-player-container" data-screen="normal">
+        <div class="scene"></div>
+        <video muted playsinline></video>
+        <div class="ctrl"><div class="pbar"><i class="buf"></i><i class="played"></i></div>
+          <div class="cbar"><span class="tm">00:00 / 12:12</span><span>4K 超清 · 倍速 · 字幕</span></div></div>
+      </div>
+      <div class="actions"><span>点赞 1.2万</span><span>投币 3468</span><span>收藏 8105</span><span>分享 912</span></div>
+      <div class="desc">全程 1 号公路环岛，素材均为 4K HDR 拍摄。BGM 见置顶评论。</div>
+      <div class="cmt"><i></i><div><b>北纬六十四度</b>第四天那段黑沙滩太好看了，看完直接开始做攻略</div></div>
+      <div class="cmt"><i></i><div><b>今天也要早睡</b>在国外看 4K 居然一点不卡，终于</div></div>
+      <div class="cmt"><i></i><div><b>Rain_Lee</b>请问无人机是哪一款？</div></div>
+    </div>
+    <aside class="right">
+      <div class="up"><i></i><div><b>慢慢开的阿舟</b><span>公路片 / 延时摄影</span></div><button class="follow">+ 关注</button></div>
+      <div class="dm">弹幕列表</div>
+      <div class="rec"><div class="th" style="background:linear-gradient(135deg,#9ec5e8,#e8d2b5)"></div><div><p>挪威峡湾自驾 3 天，每个弯都是壁纸</p><span>慢慢开的阿舟 · 8.1万播放</span></div></div>
+      <div class="rec"><div class="th" style="background:linear-gradient(135deg,#2d3b55,#8fa7c4)"></div><div><p>在极光下露营是什么体验【4K】</p><span>夜行记 · 21.6万播放</span></div></div>
+      <div class="rec"><div class="th" style="background:linear-gradient(135deg,#d7e6c9,#7aa37a)"></div><div><p>新西兰南岛十日环线全记录</p><span>Kiwi_Road · 5.3万播放</span></div></div>
+      <div class="rec"><div class="th" style="background:linear-gradient(135deg,#f0c9a8,#c46b5a)"></div><div><p>一个人在戈壁开了 2000 公里</p><span>西北偏北 · 33.9万播放</span></div></div>
+      <div class="rec"><div class="th" style="background:linear-gradient(135deg,#bfc9d6,#56657a)"></div><div><p>法罗群岛：世界尽头的小村庄</p><span>岛屿收集者 · 12.2万播放</span></div></div>
+    </aside>
+  </main>
+
+  <div class="dev">
+    <b>预览</b>
+    <button data-s="normal">正常</button><button data-s="cold">冷门视频</button><button data-s="flaky">节点故障</button><button data-s="congested">网络拥塞</button>
+    <span class="sep"></span>
+    <button data-theme>深色页面</button><button data-pause>暂停</button><button data-web>网页全屏</button><button data-reset>重置</button>
+  </div>
+</body>
+</html>

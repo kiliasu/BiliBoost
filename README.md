@@ -19,14 +19,18 @@ Measurements from outside mainland China (July 2026, 12-video sample):
 - Splits large media requests into parts fetched from several nodes at once, with a per-part watchdog and cross-node hole filling. Measured 22-103 Mbps where a single stream got about 2 Mbps; one problem video went from a 37-second start to 251 ms.
 - Falls back through a candidate chain on cache misses, warms the preferred node in the background, and force-switches nodes when playback stalls.
 - Keeps the buffer alive in background tabs through a media-driven heartbeat, so returning to the tab does not mean rebuffering.
-- Includes a panel with live throughput, per-node health, a speed test, and an exportable diagnostics report.
+- Shows live throughput in a small capsule on the video page. Clicking it opens a panel with the current speed and buffer, how each load is split across nodes, per-node stats with a speed test, and diagnostics with a copyable report. The panel follows Bilibili's light or dark theme.
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
 2. Import `bilibili-cdn-optimizer.user.js`.
 
-Covers `/video/*`, `/bangumi/play/*`, `/list/*`, `/festival/*`, and `/watchlater/*`. Settings live in `localStorage` and are edited from the floating panel.
+Covers `/video/*`, `/bangumi/play/*`, `/list/*`, `/festival/*`, and `/watchlater/*`. Settings live in `localStorage` and are edited from the panel.
+
+## Previewing the UI
+
+Open `tools/ui-preview.html` in Chrome or Edge, or serve the repository root with any static server. The page loads the script against a simulated CDN, so it does not contact Bilibili. Add `?dark=1` for a dark page, or `?s=cold`, `?s=flaky`, or `?s=congested` to start in a failure scenario.
 
 ## Limits
 
