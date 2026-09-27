@@ -27,7 +27,7 @@ Measurements from outside mainland China (July 2026, 12-video sample):
 
 ![Overview and settings in the dark theme](docs/screenshots/dark.png)
 
-Taken in `tools/ui-preview.html`, where the script runs against a simulated CDN.
+Rates and node data in the screenshots come from a simulated network.
 
 ## Install
 
@@ -36,11 +36,7 @@ Taken in `tools/ui-preview.html`, where the script runs against a simulated CDN.
 
 Covers `/video/*`, `/bangumi/play/*`, `/list/*`, `/festival/*`, and `/watchlater/*`. Settings live in `localStorage` and are edited from the panel.
 
-## Previewing the UI
-
-Open `tools/ui-preview.html` in Chrome or Edge, or serve the repository root with any static server. The page loads the script against a simulated CDN, so it does not contact Bilibili. Add `?dark=1` for a dark page, or `?s=cold`, `?s=flaky`, or `?s=congested` to start in a failure scenario.
-
 ## Limits
 
 - The script may stop working in the future.
-- Verified working on August 12, 2026.
+- Verified working on September 27, 2026.

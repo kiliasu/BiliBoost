@@ -26,7 +26,7 @@
 
 ![深色：概览、设置](docs/screenshots/dark.png)
 
-截图取自 `tools/ui-preview.html`，脚本在模拟的 CDN 上运行。
+截图中的速率与节点数据来自模拟网络。
 
 ## 安装
 
@@ -36,11 +36,7 @@
 
 支持 `/video/*`、`/bangumi/play/*`、`/list/*`、`/festival/*` 和 `/watchlater/*`。设置保存在 `localStorage` 中，可在面板里修改。
 
-## 预览界面
-
-用 Chrome 或 Edge 打开 `tools/ui-preview.html`，或在仓库根目录起任意静态服务器后访问。该页面用模拟的 CDN 运行脚本，不会访问 B 站。地址后加 `?dark=1` 为深色页面，加 `?s=cold`、`?s=flaky` 或 `?s=congested` 可直接进入对应的故障场景。
-
 ## 限制
 
 - 脚本可能在未来失效。
-- 2026-8-12 验证可用。
+- 2026-9-27 验证可用。
