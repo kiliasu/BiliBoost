@@ -20,6 +20,14 @@
 - 通过由媒体播放状态驱动的心跳机制，让后台标签页继续维持缓冲；切回页面时不必重新等待加载。
 - 在视频页显示一个实时速率胶囊，点开是面板：当前速率与缓冲、每次加载在各节点间的分配、节点数据与测速，以及可复制报告的诊断页。面板配色跟随 B 站深浅色。
 
+## 界面截图
+
+![浅色：概览、节点、诊断](docs/screenshots/light.png)
+
+![深色：概览、设置](docs/screenshots/dark.png)
+
+截图取自 `tools/ui-preview.html`，脚本在模拟的 CDN 上运行。
+
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)。

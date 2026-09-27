@@ -21,6 +21,14 @@ Measurements from outside mainland China (July 2026, 12-video sample):
 - Keeps the buffer alive in background tabs through a media-driven heartbeat, so returning to the tab does not mean rebuffering.
 - Shows live throughput in a small capsule on the video page. Clicking it opens a panel with the current speed and buffer, how each load is split across nodes, per-node stats with a speed test, and diagnostics with a copyable report. The panel follows Bilibili's light or dark theme.
 
+## Screenshots
+
+![Overview, nodes and diagnostics in the light theme](docs/screenshots/light.png)
+
+![Overview and settings in the dark theme](docs/screenshots/dark.png)
+
+Taken in `tools/ui-preview.html`, where the script runs against a simulated CDN.
+
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).

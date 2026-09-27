@@ -2,7 +2,7 @@
 // @name         BiliBoost
 // @name:en      BiliBoost
 // @namespace    bili-cdn-optimizer
-// @version      3.9.0
+// @version      4.0.0
 // @description  面向海外用户的B站自适应CDN路由工具
 // @description:en  Per-video adaptive CDN routing for Bilibili overseas users: micro-probe node selection, cold-resource fallback with background cache warming, stall circuit-breaking, and a structured diagnostics panel.
 // @author       33DD99
@@ -22,7 +22,7 @@
 
   // ═══════════════ §1 常量与节点池 ═══════════════
 
-  const VERSION = '3.9.0';
+  const VERSION = '4.0.0';
   const CFG_KEY = 'bili_cdn_opt_cfg_v3';
   const HEALTH_KEY = 'bili_cdn_opt_health_v1';
   const PREMIUM = 'upos-sz-mirrorcosov.bilivideo.com';
