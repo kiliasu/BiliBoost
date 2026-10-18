@@ -106,7 +106,8 @@
   function H(host) {
     return health[host] || (health[host] = { mbps: 0, mbpsLow: 0, ttfb: 0, ok: 0, fail: 0, last: 0 });
   }
-  function healthSample(host, mbps, ttfb) {
+  // partial=true：只有首字节或传输未完成的样本。它不能证明节点已恢复，不解除故障冷却
+  function healthSample(host, mbps, ttfb, partial) {
     const h = H(host);
     if (mbps > 0) {
       h.mbps = h.mbps ? +(h.mbps * 0.7 + mbps * 0.3).toFixed(1) : mbps;
@@ -117,9 +118,23 @@
     }
     if (ttfb > 0) h.ttfb = h.ttfb ? Math.round(h.ttfb * 0.7 + ttfb * 0.3) : ttfb;
     h.ok++; h.last = Date.now();
+    if (!partial) h.doneAt = h.last;
     saveHealth();
   }
-  function healthFail(host) { const h = H(host); h.fail++; saveHealth(); }
+  // probe=true：探测失败只计次数、不进冷却（探测常被启动流量挤占而虚假失败）
+  function healthFail(host, probe) {
+    const h = H(host);
+    h.fail++;
+    if (!probe) h.failAt = Date.now();
+    saveHealth();
+  }
+  // 近期故障：最近一次传输失败晚于最近一次完整传输成功，且仍在冷却窗内。健康分是长期均值，
+  // 历史成功多的节点失败一两次排名几乎不变，引擎分配分片时须另行避开刚失败的节点
+  const FAULT_COOL_MS = 30000;
+  function recentlyFailed(host) {
+    const h = health[host];
+    return !!(h && h.failAt > (h.doneAt || 0) && Date.now() - h.failAt < FAULT_COOL_MS);
+  }
   function healthScore(host) {
     const h = health[host];
     if (!h || !h.ok) return 0;
@@ -352,7 +367,7 @@
   function kickPlayerIfStarving() {
     if (!cfg.rescueJiggle) return;
     const v = guardedVideo || document.querySelector('video');
-    if (v && !v.paused && !v.seeking && v.readyState < 3) {
+    if (v && !v.paused && !v.seeking && v.readyState < 3 && !yieldToEngine(v)) {
       try { v.currentTime = v.currentTime + 0.05; log('info', 'route', '缓冲不足 → 微跳帧触发重新调度'); } catch (e) {}
     }
   }
@@ -511,7 +526,7 @@
     mark(cid, 'probeEnd');
 
     for (const r of results) {
-      if (r.ok) healthSample(r.host, r.mbps, r.ttfb); else healthFail(r.host);
+      if (r.ok) healthSample(r.host, r.mbps, r.ttfb); else healthFail(r.host, true);
       const detail = r.ok
         ? `${r.mbps}Mbps${r.deepMbps != null ? `（头部 ${r.headMbps} / 深部 ${r.deepMbps}）` : ''} TTFB ${r.ttfb}ms`
         : (r.deepFail ? '深部Range失败（头部可达——典型突发-饥饿）' : (r.timeout ? '超时无响应' : (r.status ? 'HTTP' + r.status : '连接失败')));
@@ -630,7 +645,8 @@
     if (!resp.body) { onDone && onDone(); return resp; }
     const reader = resp.body.getReader();
     let bytes = 0, lastChunk = performance.now(), finished = false;
-    const finish = () => {
+    // completed：正文读到结尾。空闲中止、出错、被取消的传输只留速率样本，不解除故障冷却
+    const finish = (completed) => {
       if (finished) return;
       finished = true;
       clearInterval(idleTimer);
@@ -641,7 +657,7 @@
       const sec = (performance.now() - t0) / 1000;
       if (bytes > 262144 && sec > 0.05) {
         entry.mbps = +((bytes * 8 / 1e6) / sec).toFixed(1);
-        healthSample(host, entry.mbps, 0);
+        healthSample(host, entry.mbps, 0, !completed);
       }
       onDone && onDone();
     };
@@ -661,7 +677,7 @@
     const out = new ReadableStream({
       pull(c) {
         return reader.read().then(({ done, value }) => {
-          if (done) { finish(); c.close(); return; }
+          if (done) { finish(true); c.close(); return; }
           bytes += value.length;
           bytesThisTick += value.length;
           lastChunk = performance.now();
@@ -713,7 +729,7 @@
         return { ok: false, reason: entry.outcome };
       }
       entry.outcome = '成功';
-      healthSample(host, 0, entry.ttfb);
+      healthSample(host, 0, entry.ttfb, true);         // 仅首字节样本：正文尚未传输
       // caller-abort 桥由 meterStream 在流结束/取消时解除，
       // 保证正文传输中途 abort 也能真正掐断网络
       return { ok: true, resp: meterStream(resp, host, t0, ctrl, entry, unhook), host, entry };
@@ -789,11 +805,27 @@
   // 各节点在途连接数（跨装载全局），供首发与补洞的节点分配参考
   const hostInflight = Object.create(null);
 
-  // lane 为可选的UI遥测对象：仅写入进度，不参与任何控制流
-  async function msFetchPart(u, host, lo, hi, cs, lane) {
+  // 分片看门狗：块间隔超过 PART_IDLE_MS 即中止换源，每 PART_WATCH_MS 巡检一次
+  const PART_IDLE_MS = 2500, PART_WATCH_MS = 500;
+
+  // 引擎最近一次推进（新装载开始或收到字节）的时刻。补洞重试的发起不算推进，
+  // 否则全部节点无响应时，重试链会让引擎一直显得在推进
+  let msActivityAt = 0;
+  // 引擎仍在推进：有装载在途，且距上次推进未超过引擎自行换源一次所需的时长，即看门狗
+  // 判定断流（块间隔上限 + 一个巡检周期）后，补洞请求在首字节超时上限内开始收到数据。
+  // 此时跳帧会令播放器取消整次装载，已完成的分片与补洞进度随之作废
+  function engineDelivering() {
+    const grace = PART_IDLE_MS + PART_WATCH_MS + (+cfg.ttfbTimeoutMs || 2000) + 1500;   // 后两项为 ttfbLimitFor 的上限
+    return state.msActive > 0 && performance.now() - msActivityAt < grace;
+  }
+
+  // lane 为可选的UI遥测对象：仅写入进度，不参与任何控制流。
+  // att 为本次尝试的句柄 {c, cancelled}：引擎可主动取消（竞速落败/装载结束），此类取消不计节点失败
+  async function msFetchPart(u, host, lo, hi, cs, lane, att) {
     const href = withHost(u, host);
     const ctrl = new AbortController();
     if (cs) cs.ctrls.push(ctrl);
+    if (att) att.c = ctrl;
     if (lane) { lane.host = host; lane.bytes = 0; lane.failed = 0; }
     hostInflight[host] = (hostInflight[host] || 0) + 1;
     let gotHeaders = false, idleTimer = 0;
@@ -820,8 +852,8 @@
         const now = performance.now();
         const sec = (now - t0) / 1000;
         const mbps = got * 8 / 1e6 / Math.max(0.2, sec);
-        if (now - lastChunk > 2500 || (sec > 3 && mbps < 0.3)) { try { ctrl.abort(); } catch (e) {} }
-      }, 500);
+        if (now - lastChunk > PART_IDLE_MS || (sec > 3 && mbps < 0.3)) { try { ctrl.abort(); } catch (e) {} }
+      }, PART_WATCH_MS);
       const reader = resp.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
@@ -829,7 +861,7 @@
         got += value.length;
         bytesThisTick += value.length;          // 吞吐按到达计量，在途分片也计入实时速率
         chunks.push(value);
-        lastChunk = performance.now();
+        lastChunk = msActivityAt = performance.now();
         if (lane) lane.bytes = got;
       }
       clearInterval(idleTimer); idleTimer = 0;
@@ -847,15 +879,17 @@
     } catch (e) {
       clearTimeout(ttfbTimer); clearTimeout(hardTimer);
       if (idleTimer) clearInterval(idleTimer);
-      if (!(cs && cs.aborted)) healthFail(host);
-      if (lane) lane.failed = 1;
+      const cancelled = att && att.cancelled;
+      if (!(cs && cs.aborted) && !cancelled) healthFail(host);
+      if (lane && !cancelled) lane.failed = 1;
       return { ok: false, err: String(e).slice(0, 50), aborted: cs && cs.aborted };
     } finally {
       hostInflight[host] = Math.max(0, (hostInflight[host] || 0) - 1);
     }
   }
 
-  // 引擎候选主机：按健康分排序（而非链位），优等节点自动承担part首发
+  // 引擎候选主机：按健康分排序（而非链位），优等节点自动承担part首发；
+  // 近期故障节点不占名额，排在末尾，仅作补洞的最后候选
   function engineHosts(u) {
     const set = new Set();
     const routed = routeFor(u);
@@ -868,7 +902,9 @@
     const arr = [...set].filter(h => h && (!RE_AKAM.test(h) || h === u.hostname) && !cfg.disabledHosts.includes(h));
     const scored = arr.map((h, i) => ({ h, i, s: healthScore(h) }));
     scored.sort((a, b) => (b.s - a.s) || (a.i - b.i));
-    return scored.map(x => x.h).slice(0, Math.max(3, laneCount() + 1));
+    const ranked = scored.map(x => x.h);
+    const cooled = ranked.filter(recentlyFailed);
+    return ranked.filter(h => !cooled.includes(h)).slice(0, Math.max(3, laneCount() + 1)).concat(cooled);
   }
 
   // 路数与单节点连接上限：配置可能来自导入，统一夹取
@@ -885,6 +921,7 @@
   }
 
   // 节点分配：在途连接数少者优先 → 第二连接起 h2 节点靠后 → 候选序位（健康分）；
+  // 近期故障节点排在所有未达上限的正常节点之后（宁可给正常节点开第二连接）；
   // 在途数已达单节点上限的节点仅在别无选择时启用
   function pickHost(hosts, exclude) {
     const cap = perHostLimit();
@@ -894,13 +931,14 @@
       if (exclude && exclude.has(h)) continue;
       const n = hostInflight[h] || 0;
       const h2 = n > 0 && health[h] && health[h].h2 ? 1 : 0;
-      const key = (n >= cap ? 1e6 : 0) + n * 1000 + h2 * 100 + i;
+      const key = (n >= cap ? 1e6 : 0) + (recentlyFailed(h) ? 1e5 : 0) + n * 1000 + h2 * 100 + i;
       if (key < bestKey) { best = h; bestKey = key; }
     }
     return best;
   }
 
-  // 将 [lo,hi] 切分为若干part跨节点并行拉取，返回 {buffer, total}；任一part全节点失败则整体reject
+  // 将 [lo,hi] 切分为若干part跨节点并行拉取，返回 {buffer, total}；任一part全节点失败则整体reject，
+  // 并终止其余在途分片
   async function multiSourceLoad(u, lo, hi, cs, onProgress) {
     const span = hi - lo + 1;
     const hosts = engineHosts(u);
@@ -917,11 +955,28 @@
     let realEnd = lo - 1, lastHostUsed = hosts[0];
     const partStats = [];
     state.msActive++;
+    msActivityAt = performance.now();
     const loadId = ++msLoadSeq;
     const lanes = bounds.map(([plo, phi], idx) =>
       ({ id: loadId + '-' + idx, idx, host: '', span: phi - plo + 1, bytes: 0, done: 0, failed: 0 }));
     state.msLanes = lanes;
     uiLive();
+    // 本次装载的在途尝试。Promise.all 在首个分片失败时即 reject，其余分片若不终止会继续
+    // 下载，并在调用方回退原生请求后写回过期结果；装载结束（成功或失败）时统一取消
+    const live = new Set();
+    let ended = false;
+    const cancel = (att) => {
+      if (att.cancelled) return;
+      att.cancelled = true;
+      try { if (att.c) att.c.abort(); } catch (e) {}
+    };
+    const launch = (host, plo, phi, lane) => {
+      const att = { c: null, cancelled: false };
+      live.add(att);
+      const p = msFetchPart(u, host, plo, phi, cs, lane, att);
+      p.then(() => live.delete(att), () => live.delete(att));
+      return { att, p };
+    };
     try {
     await Promise.all(bounds.map(async ([plo, phi], idx) => {
       const pT0 = performance.now();
@@ -944,38 +999,49 @@
         if (onProgress) onProgress(fetched, span);
       };
       // 首发按在途连接数与健康分序位选节点（各 lane 的选择在首个 await 前同步完成，
-      // 前序 lane 的记账对后序可见）；重试即对冲——两个未试过的节点并发先成者胜，
+      // 前序 lane 的记账对后序可见）；重试即对冲——两个未试过的节点并发，先成者胜并取消
+      // 另一路。至少补两轮，且每个候选都试过才认定失败（候选数可多于两轮覆盖的节点数）；
       // 候选耗尽时才允许回到已试节点
       const tried = new Set();
       const h0 = pickHost(hosts, tried);
       tried.add(h0);
       if (cs.aborted) throw abortError();
-      const r0 = await msFetchPart(u, h0, plo, phi, cs, lanes[idx]);
+      const r0 = await launch(h0, plo, phi, lanes[idx]).p;
+      if (ended) return;                          // 他段失败、装载已结束：结果作废
       if (r0.ok) { commit(r0, 0, h0); return; }
       if (r0.aborted) throw abortError();
-      for (let round = 1; round <= 2; round++) {
+      for (let round = 1; ; round++) {
         if (cs.aborted) throw abortError();
-        const hA = pickHost(hosts, tried) || pickHost(hosts, null);
+        let hA = pickHost(hosts, tried);
+        if (!hA) {
+          if (round > 2) break;
+          hA = pickHost(hosts, null);
+        }
         tried.add(hA);
         const hB = pickHost(hosts, tried);
         if (hB) tried.add(hB);
+        const a = launch(hA, plo, phi, lanes[idx]);
+        const b = hB ? launch(hB, plo, phi, null) : null;
         const r = await new Promise((resolve) => {
           let settled = false, fails = 0;
-          const need = hB ? 2 : 1;
-          const settle = (x, h) => {
+          const need = b ? 2 : 1;
+          const settle = (x, h, peer) => {
             if (settled) return;
-            if (x.ok) { settled = true; resolve({ win: x, host: h }); }
+            if (x.ok) { settled = true; if (peer) cancel(peer.att); resolve({ win: x, host: h }); }
             else if (++fails >= need) { settled = true; resolve({ win: x, host: h }); }
           };
-          msFetchPart(u, hA, plo, phi, cs, lanes[idx]).then(x => settle(x, hA));
-          if (hB) msFetchPart(u, hB, plo, phi, cs).then(x => settle(x, hB));
+          a.p.then(x => settle(x, hA, b));
+          if (b) b.p.then(x => settle(x, hB, a));
         });
+        if (ended) return;
         if (r.win.ok) { commit(r.win, round, r.host); return; }
         if (r.win.aborted) throw abortError();
       }
       throw new Error('part' + idx + ' 全部候选节点失败');
     }));
     } finally {
+      ended = true;
+      live.forEach(cancel);
       state.msActive = Math.max(0, state.msActive - 1);
       setTimeout(() => { if (state.msLanes === lanes) state.msLanes = []; }, 450);   // 保留完成态闪光
     }
@@ -1124,7 +1190,52 @@
   // XHR 路径（实测为播放器分片主通道）
   const xhrOpen = XMLHttpRequest.prototype.open;
   const xhrSend = XMLHttpRequest.prototype.send;
+  const xhrAbort = XMLHttpRequest.prototype.abort;
+
+  // 实例级影子属性/方法：首次覆盖时保存实例上原有的自有属性（通常没有），
+  // 回退原生或实例复用时逐一还原
+  function shadowXhr(xhr, key, desc) {
+    try {
+      const saved = xhr.__bcoShadow || (xhr.__bcoShadow = new Map());
+      if (!saved.has(key)) saved.set(key, Object.getOwnPropertyDescriptor(xhr, key));
+      Object.defineProperty(xhr, key, Object.assign({ configurable: true }, desc));
+    } catch (e) {}
+  }
+  function unshadowXhr(xhr) {
+    const saved = xhr.__bcoShadow;
+    if (!saved) return;
+    xhr.__bcoShadow = null;
+    saved.forEach((d, k) => { try { if (d) Object.defineProperty(xhr, k, d); else delete xhr[k]; } catch (e) {} });
+  }
+  // 本轮请求挂在实例上的监听器，复用实例时由下一次 open 摘除
+  function onXhr(xhr, type, fn) {
+    xhr.addEventListener(type, fn);
+    (xhr.__bcoListeners || (xhr.__bcoListeners = [])).push([type, fn]);
+  }
+  // 实例复用（再次 open）：与原生 open 一样静默终止上一轮请求，摘除上一轮的监听器与
+  // 影子属性，交还原生状态——否则新请求会读到上一轮的 readyState/status/response
+  function releaseXhr(xhr) {
+    const run = xhr.__bcoRun;
+    if (run) {
+      xhr.__bcoRun = null;
+      if (!run.aborted && !run.done) {
+        run.aborted = true;
+        run.ctrls.forEach(c => { try { c.abort(); } catch (e) {} });
+      }
+    }
+    // 上一轮请求（合成或原生）若仍在途，记为播放器取消：原生 open 会静默终止它，不派发任何事件
+    const prev = xhr.__bcoEntry;
+    if (prev && prev.outcome === '进行中') prev.outcome = '播放器取消';
+    const ls = xhr.__bcoListeners;
+    if (ls) {
+      xhr.__bcoListeners = null;
+      ls.forEach(([t, f]) => { try { xhr.removeEventListener(t, f); } catch (e) {} });
+    }
+    unshadowXhr(xhr);
+  }
+
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    try { releaseXhr(this); } catch (e) {}
     this.__bcoHost = null;
     this.__bcoApi = false;
     try {
@@ -1161,17 +1272,22 @@
         const entry = this.__bcoEntry;
         entry.note = '多源';
         pushReq(entry);
-        const cs = { aborted: false, ctrls: [] };
+        const cs = { aborted: false, done: false, ctrls: [] };
+        xhr.__bcoRun = cs;
+        // 本轮合成请求仍在途且归属该实例：未被取消、未完成、未回退原生、未被再次 open 复用。
+        // 迟到的装载回调一律以此为准，不得改写已交还原生或已属于新请求的实例状态
+        const live = () => xhr.__bcoRun === cs && !cs.aborted && !cs.done;
         const t0 = performance.now();
         const u = new URL(this.__bcoUrl, location.href);
-        const nativeAbort = xhr.abort.bind(xhr);
-        xhr.abort = function () {
+        shadowXhr(xhr, 'abort', { writable: true, value: function () {
+          if (xhr.__bcoRun !== cs || cs.aborted) return xhrAbort.call(xhr);
           cs.aborted = true;
+          if (cs.done) return xhrAbort.call(xhr);       // 合成响应已完成：按原生语义，不再派发事件
           cs.ctrls.forEach(c => { try { c.abort(); } catch (e) {} });
           entry.outcome = '播放器取消';
           try { xhr.dispatchEvent(new ProgressEvent('abort')); xhr.dispatchEvent(new ProgressEvent('loadend')); } catch (e) {}
-        };
-        const def = (k, v) => { try { Object.defineProperty(xhr, k, { configurable: true, get: () => v }); } catch (e) {} };
+        } });
+        const def = (k, v) => shadowXhr(xhr, k, { get: () => v });
         const fireRS = (n) => { def('readyState', n); try { xhr.dispatchEvent(new Event('readystatechange')); } catch (e) {} };
         // 合成响应必须遵循 XHR 事件时序：loadstart → RS2(头) → RS3 → progress* → RS4 → load；
         // 播放器 QoS 在 RS2 才建立请求记录，时序缺失会致其回调报错刷屏
@@ -1180,19 +1296,22 @@
         // 响应头不得宣称超出实际交付的字节数
         let fileTotal = 0, headersSent = false, realHi = hi, realSpan = span;
         const setHeaders = () => {
-          xhr.getResponseHeader = (k) => {
+          shadowXhr(xhr, 'getResponseHeader', { writable: true, value: (k) => {
             const key = String(k).toLowerCase();
             if (key === 'content-length') return String(realSpan);
             if (key === 'content-range') return `bytes ${lo}-${realHi}/${fileTotal || '*'}`;
             if (key === 'content-type') return 'application/octet-stream';
             if (key === 'accept-ranges') return 'bytes';
             return null;
-          };
-          xhr.getAllResponseHeaders = () =>
-            `content-type: application/octet-stream\r\naccept-ranges: bytes\r\ncontent-length: ${realSpan}\r\ncontent-range: bytes ${lo}-${realHi}/${fileTotal || '*'}\r\n`;
+          } });
+          shadowXhr(xhr, 'getAllResponseHeaders', { writable: true, value: () =>
+            `content-type: application/octet-stream\r\naccept-ranges: bytes\r\ncontent-length: ${realSpan}\r\ncontent-range: bytes ${lo}-${realHi}/${fileTotal || '*'}\r\n` });
         };
+        // 返回本轮请求是否仍有效。播放器可能在事件回调里同步 abort 或重新 open，规范要求
+        // 此时停止原流程（派发 RS2 后状态已不是 HEADERS_RECEIVED 即返回），每次派发后都要复查
         const emitHeaders = () => {
-          if (headersSent || cs.aborted) return;
+          if (!live()) return false;
+          if (headersSent) return true;
           headersSent = true;
           def('status', 206); def('statusText', 'Partial Content'); def('responseURL', u.href);
           const rt0 = xhr.responseType;
@@ -1200,26 +1319,22 @@
           if (rt0 === '' || rt0 === 'text') def('responseText', '');
           setHeaders();
           fireRS(2);
+          if (!live()) return false;
           fireRS(3);
+          return live();
         };
         setTimeout(() => {
-          if (cs.aborted) return;
+          if (!live()) return;
           try { xhr.dispatchEvent(new ProgressEvent('loadstart', { lengthComputable: true, loaded: 0, total: span })); } catch (e) {}
         }, 0);
         multiSourceLoad(u, lo, hi, cs, (loaded, total) => {
-          emitHeaders();
+          if (!emitHeaders()) return;
           try { xhr.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded, total })); } catch (e) {}
         }).then(({ buffer, total, end }) => {
-          if (cs.aborted) return;
+          if (!live()) return;
           fileTotal = total || 0;
           if (typeof end === 'number' && end >= lo) { realHi = end; realSpan = end - lo + 1; }
-          entry.outcome = '成功';
-          entry.ms = Math.round(performance.now() - t0);
-          entry.kb = Math.round(realSpan / 1024);
-          entry.ttfb = 0;
-          const sec = entry.ms / 1000;
-          if (sec > 0.05) entry.mbps = +((realSpan * 8 / 1e6) / sec).toFixed(1);
-          emitHeaders();
+          if (!emitHeaders()) return;
           setHeaders();                                   // 此时 total 已知，刷新 Content-Range
           const rt = xhr.responseType;
           let resp;
@@ -1227,19 +1342,27 @@
           else if (rt === 'blob') resp = new Blob([buffer]);
           else resp = buffer;
           def('response', resp);
+          entry.outcome = '成功';
+          entry.ms = Math.round(performance.now() - t0);
+          entry.kb = Math.round(realSpan / 1024);
+          entry.ttfb = 0;
+          const sec = entry.ms / 1000;
+          if (sec > 0.05) entry.mbps = +((realSpan * 8 / 1e6) / sec).toFixed(1);
+          cs.done = true;                                 // 合成请求完成：此后 abort 按原生语义处理
           fireRS(4);
+          // RS4 回调里重新 open 或 abort 后不再派发 load/loadend（与 Chromium 一致），以免落到新请求上
+          const owned = () => xhr.__bcoRun === cs && !cs.aborted;
           try {
-            xhr.dispatchEvent(new ProgressEvent('load', { lengthComputable: true, loaded: realSpan, total: realSpan }));
-            xhr.dispatchEvent(new ProgressEvent('loadend', { lengthComputable: true, loaded: realSpan, total: realSpan }));
+            if (owned()) xhr.dispatchEvent(new ProgressEvent('load', { lengthComputable: true, loaded: realSpan, total: realSpan }));
+            if (owned()) xhr.dispatchEvent(new ProgressEvent('loadend', { lengthComputable: true, loaded: realSpan, total: realSpan }));
           } catch (e) {}
         }).catch((err) => {
-          if (cs.aborted) return;
+          if (!live()) return;
           entry.outcome = '聚合失败→原生';
           log('warn', 'net', `多源聚合失败(${String((err && err.message) || err).slice(0, 60)}) → 回退原生XHR`);
-          // 清除已影子化的属性，交还原生 XHR 状态机（否则 readyState 等会被冻结在合成值）
-          ['readyState', 'status', 'statusText', 'responseURL', 'response', 'responseText',
-           'getResponseHeader', 'getAllResponseHeaders'].forEach(k => { try { delete xhr[k]; } catch (e) {} });
-          xhr.abort = nativeAbort;
+          // 本轮合成请求作废：清除影子属性，交还原生 XHR 状态机（否则 readyState 等会被冻结在合成值）
+          xhr.__bcoRun = null;
+          unshadowXhr(xhr);
           try { xhrSend.apply(xhr, args); } catch (e2) {
             try { xhr.dispatchEvent(new ProgressEvent('error')); } catch (e3) {}
           }
@@ -1252,15 +1375,15 @@
       const entry = this.__bcoEntry;
       const t0 = performance.now();
       if (entry) pushReq(entry);
-      this.addEventListener('readystatechange', function () {
+      onXhr(this, 'readystatechange', function () {
         if (entry && this.readyState === 2 && entry.ttfb < 0) entry.ttfb = Math.round(performance.now() - t0);
       });
       // 吞吐按到达计量：progress 逐段累加，load 时补齐余量
       let metered = 0;
-      this.addEventListener('progress', function (e) {
+      onXhr(this, 'progress', function (e) {
         if (e.loaded > metered) { bytesThisTick += e.loaded - metered; metered = e.loaded; }
       });
-      this.addEventListener('load', function () {
+      onXhr(this, 'load', function () {
         try {
           const n = (this.response && this.response.byteLength) || 0;
           if (n > metered) { bytesThisTick += n - metered; metered = n; }
@@ -1275,24 +1398,24 @@
           }
         } catch (e) {}
       });
-      this.addEventListener('error', function () { if (entry) entry.outcome = '连接失败'; healthFail(host); });
-      this.addEventListener('timeout', function () { if (entry) entry.outcome = '超时'; healthFail(host); });
-      this.addEventListener('abort', function () { if (entry) entry.outcome = '播放器取消'; });
+      onXhr(this, 'error', function () { if (entry) entry.outcome = '连接失败'; healthFail(host); });
+      onXhr(this, 'timeout', function () { if (entry) entry.outcome = '超时'; healthFail(host); });
+      onXhr(this, 'abort', function () { if (entry) entry.outcome = '播放器取消'; });
     }
     if (this.__bcoApi) {
-      this.addEventListener('readystatechange', function () {
+      onXhr(this, 'readystatechange', function () {
         if (this.readyState !== 4) return;
         try {
           if (this.responseType === '' || this.responseType === 'text') {
             const data = JSON.parse(this.responseText);
             transformPlayinfo(data);
             const txt = JSON.stringify(data);
-            Object.defineProperty(this, 'responseText', { configurable: true, get: () => txt });
-            Object.defineProperty(this, 'response', { configurable: true, get: () => txt });
+            shadowXhr(this, 'responseText', { get: () => txt });
+            shadowXhr(this, 'response', { get: () => txt });
           } else if (this.responseType === 'json' && this.response) {
             const d = this.response;
             transformPlayinfo(d);
-            Object.defineProperty(this, 'response', { configurable: true, get: () => d });
+            shadowXhr(this, 'response', { get: () => d });
           }
         } catch (e) {}
       });
@@ -1312,11 +1435,42 @@
     return pool[(i + 1) % pool.length];
   }
 
+  // 播放器是否在等网络数据：播放位置所在缓冲段已几乎耗尽，且前方 0.5s 内没有下一段缓冲。
+  // 前方已有数据（小空洞）时卡住与网络无关，跳帧反而能越过空洞
+  function starvedAt(v) {
+    if (playableAhead(v) >= 0.5) return false;
+    const t = v.currentTime, b = v.buffered;
+    for (let i = 0; b && i < b.length; i++) { const s = b.start(i); if (s > t && s - t <= 0.5) return false; }
+    return true;
+  }
+  // 有单源媒体请求（原生 XHR、fetch 回退链）在途已超过熔断阈值：播放器可能正卡在它上面，
+  // 跳帧正是为了让播放器重发它
+  function nativeMediaStuck() {
+    const cutoff = Date.now() - cfg.stallMs;
+    return state.reqLog.some(e => e.outcome === '进行中' && e.note !== '多源' && e.t < cutoff);
+  }
+  // 跳帧是否应让位于引擎：引擎仍在推进，播放器确实在等网络数据，且没有卡住的单源请求。
+  // 不设固定时限：慢速但持续推进的装载被打断只会从头重来，形成整段重载的循环
+  function yieldToEngine(v) {
+    return engineDelivering() && starvedAt(v) && !nativeMediaStuck();
+  }
+
+  let stallYieldLast = 0;
+
   function onStall() {
+    if (stallTimer) clearTimeout(stallTimer);   // 进度监测直接调用时可能还挂着 waiting 计时器，避免重复熔断
     stallTimer = 0;
     if (!cfg.enabled || cfg.mode !== 'auto') return;
     const v = guardedVideo;
     if (!v || v.paused || v.seeking) return;
+    if (yieldToEngine(v)) {
+      const now = performance.now();
+      if (now - stallYieldLast > 2500) log('info', 'stall', '播放停滞，多源引擎仍在推进装载 → 暂缓熔断');   // 每轮停滞只记一次
+      stallYieldLast = now;
+      stallTimer = setTimeout(onStall, 1000);   // 每秒复查，直到播放恢复或引擎停止推进
+      return;
+    }
+    stallYieldLast = 0;
     state.stalls++;
     const cid = state.activeCid;
     if (cid) { const t = tl(cid); (t.stallsAt = t.stallsAt || []).push(performance.now()); }
@@ -1386,6 +1540,7 @@
   function bgKick(reason, tag) {
     const v = guardedVideo || document.querySelector('video');
     if (!v || v.paused || v.seeking || v.ended) return false;
+    if (engineDelivering() && !nativeMediaStuck()) return false;   // 补给已在途：跳帧只会令播放器取消它
     const now = Date.now();
     if (now - bg.lastKickAt < 1200) return false;
     bg.lastKickAt = now;
@@ -1467,7 +1622,7 @@
       if (RE_AKAM.test(h) && h !== orig) { onRow({ host: h, ok: false, skip: '签名限制' }); continue; }
       if (onStart) onStart(h);
       const r = await probeHost(src, h, sizeKB, 8000);
-      if (r.ok) healthSample(r.host, r.mbps, r.ttfb); else healthFail(r.host);
+      if (r.ok) healthSample(r.host, r.mbps, r.ttfb); else healthFail(r.host, true);
       onRow(r);
     }
   }

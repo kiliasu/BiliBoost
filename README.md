@@ -39,4 +39,4 @@ Covers `/video/*`, `/bangumi/play/*`, `/list/*`, `/festival/*`, and `/watchlater
 ## Limits
 
 - The script may stop working in the future.
-- Verified working on September 27, 2026.
+- Verified working on October 17, 2026.
