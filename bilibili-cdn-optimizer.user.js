@@ -2,7 +2,7 @@
 // @name         BiliBoost
 // @name:en      BiliBoost
 // @namespace    bili-cdn-optimizer
-// @version      4.1.0
+// @version      4.1.1
 // @description  面向海外用户的B站自适应CDN路由工具
 // @description:en  Per-video adaptive CDN routing for Bilibili overseas users: micro-probe node selection, cold-resource fallback with background cache warming, stall circuit-breaking, and a structured diagnostics panel.
 // @author       33DD99
@@ -22,7 +22,7 @@
 
   // ═══════════════ §1 常量与节点池 ═══════════════
 
-  const VERSION = '4.1.0';
+  const VERSION = '4.1.1';
   const CFG_KEY = 'bili_cdn_opt_cfg_v3';
   const HEALTH_KEY = 'bili_cdn_opt_health_v1';
   const PREMIUM = 'upos-sz-mirrorcosov.bilivideo.com';
@@ -1574,6 +1574,20 @@
 
   let guardedVideo = null, stallTimer = 0;
 
+  // 捕获实际播放请求；预加载、起播前暂停不计时。不能等哨兵轮询绑定，否则会漏掉快速起播。
+  ['play', 'playing', 'pause', 'emptied'].forEach(type => document.addEventListener(type, e => {
+    const v = e.target;
+    if (v !== document.querySelector('video')) return;
+    syncPlayingVideo();
+    const cid = playerCid() || state.activeCid;
+    if (!cid) return;
+    const t = tl(cid);
+    if (t.firstFrameAt != null) return;
+    if (type === 'play' && !v.paused) t.playRequestedAt = performance.now();
+    else if (type === 'pause' || type === 'emptied') delete t.playRequestedAt;
+    else if (type === 'playing' && !v.paused) mark(cid, 'firstFrameAt');
+  }, true));
+
   function nextCandidateAfter(current) {
     const pool = coldReliableRanked();
     if (!pool.length) return current || FALLBACK_MAINLAND;
@@ -1645,7 +1659,6 @@
     v.addEventListener('stalled', arm);
     ['playing', 'canplay', 'timeupdate', 'pause', 'seeking'].forEach(ev => v.addEventListener(ev, disarm));
     v.addEventListener('timeupdate', bgHeartbeat);   // 后台缓冲维持的心跳源
-    v.addEventListener('playing', () => { syncPlayingVideo(); if (state.activeCid) mark(state.activeCid, 'firstFrameAt'); });   // 逐P标记首帧（mark按cid幂等）
     // 播放器报错哨兵：媒体错误（黑屏/解码失败）时清除可能中毒的裁决，让重试从干净路由开始
     v.addEventListener('error', () => {
       syncPlayingVideo();
@@ -1848,24 +1861,24 @@
         `开头 ${burst.headMbps} Mbps，后段仅 ${burst.deepMbps} Mbps，已按后段速度评估`);
     }
 
-    if (t.firstFrameAt != null) {
-      const boot = Math.round(t.firstFrameAt - t.t0);
-      const probeCost = t.probeEnd && t.probeStart ? Math.round(t.probeEnd - t.probeStart) : null;
-      const waitCost = t.firstOkAt && t.firstReqAt ? Math.round(t.firstOkAt - t.firstReqAt) : null;
-      const parts = [];
-      if (probeCost != null) parts.push(`测速 ${probeCost} ms`);
-      if (waitCost != null) parts.push(`等待首个分片 ${waitCost} ms`);
+    if (t.firstFrameAt != null && t.playRequestedAt != null) {
+      const boot = Math.round(t.firstFrameAt - t.playRequestedAt);
+      const detail = '从播放器请求播放到开始播放，不含播放前停留时间';
       if (boot > 6000) {
         add('crit', `起播较慢：${(boot / 1000).toFixed(1)} 秒`,
-          parts.join('，'),
+          detail,
           '可在设置中调低「首字节超时」与「对冲延迟」');
       } else if (boot > 3000) {
-        add('warn', `起播 ${(boot / 1000).toFixed(1)} 秒`, parts.join('，'));
+        add('warn', `起播 ${(boot / 1000).toFixed(1)} 秒`, detail);
       } else {
-        add('ok', `起播 ${(boot / 1000).toFixed(1)} 秒`, parts.join('，') || '各阶段均无明显等待');
+        add('ok', `起播 ${(boot / 1000).toFixed(1)} 秒`, detail);
       }
-    } else if (t.firstReqAt != null && performance.now() - t.firstReqAt > 6000) {
-      add('crit', '视频尚未开始播放', '已发出加载请求，但画面还没出来；详见请求记录');
+    } else if (t.firstFrameAt != null) {
+      add('info', '已开始播放', '未记录到播放请求，无法计算起播耗时');
+    } else if (t.playRequestedAt != null && performance.now() - t.playRequestedAt > 6000) {
+      add('crit', '视频尚未开始播放', '已请求播放超过 6 秒，播放器仍未开始播放；详见请求记录');
+    } else if (t.playRequestedAt == null) {
+      add('info', '等待开始播放', '预加载不计入起播耗时，播放器请求播放后开始计时');
     }
 
     if (failsOnAssigned >= 2) {
@@ -3183,7 +3196,7 @@ table.rq { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
         <button class="btn" id="dg-copy">复制诊断报告</button>
       </div>
       <div id="dg-finds"></div>
-      <section class="sec" id="dg-tl-sec" hidden><h3>起播时间线</h3><div id="dg-tl"></div></section>
+      <section class="sec" id="dg-tl-sec" hidden><h3>加载与播放时间线（相对视频注册）</h3><div id="dg-tl"></div></section>
       <section class="sec fold" data-open="${diagFold.reqs ? 1 : 0}">
         <button class="fold-h" data-fold="reqs" aria-expanded="${diagFold.reqs}"><span>请求记录</span><span class="n" id="dg-reqs-n"></span><i class="chev"></i></button>
         <div class="fold-b" id="dg-reqs"></div>
@@ -3244,7 +3257,8 @@ table.rq { width: 100%; border-collapse: collapse; font: 11px/1.4 var(--mono); }
       ['测速完成', t.probeEnd],
       ['选定线路', t.verdictAt],
       ['首个分片', t.firstOkAt],
-      ['首帧', t.firstFrameAt],
+      ['请求播放', t.playRequestedAt],
+      ['开始播放', t.firstFrameAt],
     ].filter(m => m[1] != null).map(m => [m[0], Math.max(0, m[1] - t.t0)]);
     if (!marks.length) return '';
     const max = Math.max(600, ...marks.map(m => m[1]));
